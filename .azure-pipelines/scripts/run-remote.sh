@@ -1,6 +1,5 @@
 #!/bin/bash
 # Run a command on remote CI VMs via parallel-ssh.
-# By default, runs inside the mscclpp-test docker container.
 #
 # Usage:
 #   run-remote.sh [OPTIONS] < <command_script>
