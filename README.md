@@ -37,7 +37,7 @@ We have packaged two tests with the shim library: (i) verbs perftest and (ii) NC
 
 ## Verbs perftest
 
-To use [rdma-perftest](https://github.com/linux-rdma/perftest) over the shim library, please clone and build verbs perftest as follows:
+To run [rdma-perftest](https://github.com/linux-rdma/perftest) over the shim library, please clone and build verbs perftest as follows:
 ```
 cd tests/perftest
 ./build-script.sh
