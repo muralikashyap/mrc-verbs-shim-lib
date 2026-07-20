@@ -3,7 +3,10 @@
 
 /* Overwrite ibverbs calls. */
 
+#define _GNU_SOURCE
+
 #include <arpa/inet.h>
+#include <dlfcn.h>
 #include <errno.h>
 #include <infiniband/verbs.h>
 #include <stdio.h>
@@ -14,6 +17,35 @@
 #include "include/vmrc_log.h"
 #include "include/vmrc_symbols.h"
 #include "mrc.h"
+
+/*
+ * CRITICAL ABI ASSUMPTION: struct mrc_qp first member layout
+ *
+ * The shim relies on the following struct mrc_qp memory layout contract:
+ *
+ *   struct mrc_qp {
+ *       struct ibv_qp *ibv_qp;    // <-- MUST be the first member
+ *       ...                        // other members
+ *   };
+ *
+ * WHY THIS MATTERS:
+ * - The shim returns a dummy ibv_qp to applications
+ * - The dummy->send_cq field stores the mrc_qp* pointer
+ * - Provider-specific interceptors (ionic_dv_*) need the REAL ibv_qp
+ * - They cast: mrc_qp* = (struct mrc_qp*)dummy_qp->send_cq
+ *   then access: real_qp = ((struct ibv_qp**)mrc_qp)[0]
+ *
+ * This works ONLY because ibv_qp* is the first member. If libmrc changes
+ * this layout, the shim will break. This is a documented ABI contract.
+ *
+ * The dummy ibv_qp returned to applications is legitimate:
+ *   - Has correct qp_num from MRC
+ *   - Has ops pointers routing to shim handlers (post_send/recv, poll_cq)
+ *   - send_cq field stores mrc_qp* (not a real CQ, used as storage)
+ *
+ * VERIFICATION: This assumption matches libmrc's internal mrc_defines.h
+ * as of the current version. Do NOT include mrc_defines.h (internal header).
+ */
 
 #define VMRC_DEF_VIS __attribute__((visibility("default")))
 
@@ -73,12 +105,224 @@ VMRC_WRAP_SYMVER(ibv_event_type_str, "IBVERBS_1.1", const char*, (enum ibv_event
 VMRC_WRAP_SYMVER_ERR(ibv_query_ece, "IBVERBS_1.10", int, (struct ibv_qp * qp, struct ibv_ece* ece), (qp, ece))
 VMRC_WRAP_SYMVER_ERR(ibv_set_ece, "IBVERBS_1.10", int, (struct ibv_qp * qp, struct ibv_ece* ece), (qp, ece))
 
-/* We cannot overwrite qp_ex with shim since ibv_create_qp_ex is a function pointer. */
+/*
+ * Original provider create_qp_ex, saved per-context before we overwrite the op in
+ * open_device.
+ *
+ * On this rdma-core, the app's plain ibv_create_qp() resolves to our symbol override
+ * ovwrt_ibv_create_qp() (which does the MRC QP setup). That MRC path then calls the
+ * REAL ibv_create_qp() to build the underlying provider QP, and rdma-core dispatches
+ * that real call through context->ops.create_qp_ex -- i.e. this trap. So the only
+ * caller that reaches this trap is libmrc's internal provider-QP creation, which must
+ * go to the genuine provider, not back into the shim (that would recurse infinitely).
+ * Forward to the saved original.
+ *
+ * Per-context storage makes this provider-neutral and thread-safe (no global state).
+ */
 struct ibv_qp* vmrc_ibv_overwrite_create_qp_ex(struct ibv_context* context,
                                                struct ibv_qp_init_attr_ex* qp_init_attr_ex) {
-  VMRC_CHECK_PRINT_EXIT(NULL, 1, "create_qp_ex cannot be used with verbs-mrc");
-  return NULL;
+  struct vmrc_ht* hashtable;
+  void* addr_of_value;
+  struct ibv_qp* (*orig_create_qp_ex)(struct ibv_context*, struct ibv_qp_init_attr_ex*);
+  struct vmrc_ht_linked_list* attr;
+
+  hashtable = vmrc_ht_get();
+  VMRC_CHECK_PRINT_EXIT(hashtable, 1, "create_qp_ex: could not get hashtable");
+
+  /* Find the context entry to retrieve the saved original create_qp_ex pointer. */
+  (void)vmrc_ht_search_plus_addr(hashtable, context, &addr_of_value);
+  VMRC_CHECK_PRINT_EXIT(addr_of_value, 1,
+                        "create_qp_ex: context not found in hashtable");
+
+  attr = (struct vmrc_ht_linked_list*)vmrc_ht_attr_get(addr_of_value,
+                                                         VMRC_HT_ATTR_ORIG_CREATE_QP_EX_IDX);
+  VMRC_CHECK_PRINT_EXIT(attr, 1,
+                        "create_qp_ex: original provider op was not saved");
+
+  orig_create_qp_ex = (struct ibv_qp* (*)(struct ibv_context*,
+                                           struct ibv_qp_init_attr_ex*))
+                       attr->ptr_and_next[VMRC_HT_LL_PTR];
+  VMRC_CHECK_PRINT_EXIT(orig_create_qp_ex, 1,
+                        "create_qp_ex: saved pointer is NULL");
+
+  return orig_create_qp_ex(context, qp_init_attr_ex);
 }
+
+#ifdef HAVE_IONIC_DV
+/*
+ * Resolve a genuine provider ionic_dv_* symbol.
+ *
+ * We first try RTLD_NEXT (works when the real ionic provider is already in the
+ * global scope, e.g. when the app/ANP links libionic directly). When ANP is
+ * built WITHOUT -lionic, the real symbols live only in the rdma-core provider
+ * plugin (libionic-rdmav34.so), which libibverbs dlopen's RTLD_LOCAL and is thus
+ * invisible to RTLD_NEXT. In that case we fall back to an explicit dlopen of
+ * libionic.so.1 (overridable via VMRC_LIBIONIC_SO), which pulls in the versioned
+ * ionic_dv_* symbols. The handle is cached process-wide.
+ */
+static void* vmrc_resolve_ionic_sym(const char* name, const char* ver) {
+  void* sym = dlvsym(RTLD_NEXT, name, ver);
+  if (sym == NULL) sym = dlsym(RTLD_NEXT, name);
+  if (sym != NULL) return sym;
+
+  static void* ionic_handle = NULL;
+  if (ionic_handle == NULL) {
+    const char* path = getenv("VMRC_LIBIONIC_SO");
+    if (path == NULL) path = "libionic.so.1";
+    ionic_handle = dlopen(path, RTLD_NOW | RTLD_GLOBAL);
+  }
+  if (ionic_handle == NULL) return NULL;
+
+  sym = dlvsym(ionic_handle, name, ver);
+  if (sym == NULL) sym = dlsym(ionic_handle, name);
+  return sym;
+}
+
+/*
+ * Intercept ionic_dv_qp_set_multiplane_conn_info.
+ *
+ * perftest (and other apps) call this provider-specific helper directly on the QP
+ * returned by ibv_create_qp(). Under the shim that QP is a dummy, so the real
+ * libionic would reject it (is_ionic_qp() -> EPERM). We instead recover the real
+ * ionic QP that libmrc created internally (stashed as mrc_qp* in dummy->send_cq,
+ * its first member being the real ibv_qp) and forward the call there. The provider
+ * stores the routes and carries them to HW on its own modify_qp(RTR) path -- we do
+ * NOT issue any NIC command here. conn_info is passed straight through as an opaque
+ * pointer so we don't have to mirror libionic's struct.
+ */
+static int (*g_real_ionic_set_mp_conn_info)(struct ibv_qp*, const void*) = NULL;
+
+__asm__(".symver ovwrt_ionic_dv_qp_set_multiplane_conn_info, "
+        "ionic_dv_qp_set_multiplane_conn_info@@IONIC_1.2");
+VMRC_DEF_VIS int ovwrt_ionic_dv_qp_set_multiplane_conn_info(struct ibv_qp* verbs_qp,
+                                                            const void* conn_info) {
+  struct mrc_qp* vmrc_qp;
+  struct ibv_qp* real_qp;
+
+  VMRC_DEBUG_PRINT("In ionic_dv_qp_set_multiplane_conn_info");
+
+  VMRC_CHECK_PRINT_EXIT(verbs_qp, 1, "set_multiplane_conn_info: NULL qp");
+
+  /* Recover the real ionic QP from the dummy (mrc_qp* lives in send_cq).
+   * Access the first member (ibv_qp*) without knowing the full struct layout. */
+  vmrc_qp = (struct mrc_qp*)verbs_qp->send_cq;
+  VMRC_CHECK_PRINT_EXIT(vmrc_qp, 1, "set_multiplane_conn_info: no mrc_qp on dummy");
+  /* Read the first member (ibv_qp*) by treating mrc_qp as an array of pointers. */
+  real_qp = ((struct ibv_qp**)vmrc_qp)[0];
+  VMRC_CHECK_PRINT_EXIT(real_qp, 1, "set_multiplane_conn_info: no real ibv_qp");
+
+  /* Resolve the genuine provider symbol (skip our own export via RTLD_NEXT). */
+  if (g_real_ionic_set_mp_conn_info == NULL) {
+    void* sym = vmrc_resolve_ionic_sym("ionic_dv_qp_set_multiplane_conn_info", "IONIC_1.2");
+    VMRC_CHECK_PRINT_EXIT(sym, 1,
+        "set_multiplane_conn_info: cannot resolve real provider symbol");
+    *(void**)&g_real_ionic_set_mp_conn_info = sym;
+  }
+
+  return g_real_ionic_set_mp_conn_info(real_qp, conn_info);
+}
+
+/*
+ * Intercept ionic_dv_qp_set_gda and ionic_dv_qp_set_puec_plane_route.
+ *
+ * Same problem/solution as set_multiplane_conn_info above: ANP (RCCL net plugin)
+ * calls these provider-specific helpers directly on the QP returned by
+ * ibv_create_qp(), which under the shim is a dummy. The real libionic would reject
+ * it (is_ionic_qp() -> EPERM). We recover the real ionic QP (mrc_qp* stashed in
+ * dummy->send_cq, first member is the real ibv_qp) and forward to the genuine
+ * provider symbol resolved via RTLD_NEXT. These are IONIC_1.0 symbols. The route
+ * arg is passed straight through as an opaque pointer so we don't depend on the
+ * provider's struct layout.
+ */
+static int (*g_real_ionic_set_gda)(struct ibv_qp*, _Bool, _Bool) = NULL;
+
+__asm__(".symver ovwrt_ionic_dv_qp_set_gda, ionic_dv_qp_set_gda@@IONIC_1.0");
+VMRC_DEF_VIS int ovwrt_ionic_dv_qp_set_gda(struct ibv_qp* verbs_qp,
+                                           _Bool enable_send, _Bool enable_recv) {
+  struct mrc_qp* vmrc_qp;
+  struct ibv_qp* real_qp;
+
+  VMRC_DEBUG_PRINT("In ionic_dv_qp_set_gda");
+
+  VMRC_CHECK_PRINT_EXIT(verbs_qp, 1, "set_gda: NULL qp");
+
+  /* Recover the real ionic QP: mrc_qp* stored in send_cq, ibv_qp* is first member. */
+  vmrc_qp = (struct mrc_qp*)verbs_qp->send_cq;
+  VMRC_CHECK_PRINT_EXIT(vmrc_qp, 1, "set_gda: no mrc_qp on dummy");
+  real_qp = ((struct ibv_qp**)vmrc_qp)[0];
+  VMRC_CHECK_PRINT_EXIT(real_qp, 1, "set_gda: no real ibv_qp");
+
+  if (g_real_ionic_set_gda == NULL) {
+    void* sym = vmrc_resolve_ionic_sym("ionic_dv_qp_set_gda", "IONIC_1.0");
+    VMRC_CHECK_PRINT_EXIT(sym, 1, "set_gda: cannot resolve real provider symbol");
+    *(void**)&g_real_ionic_set_gda = sym;
+  }
+
+  return g_real_ionic_set_gda(real_qp, enable_send, enable_recv);
+}
+
+static int (*g_real_ionic_set_puec_plane_route)(struct ibv_qp*, uint8_t,
+                                                void*) = NULL;
+
+__asm__(".symver ovwrt_ionic_dv_qp_set_puec_plane_route, "
+        "ionic_dv_qp_set_puec_plane_route@@IONIC_1.0");
+VMRC_DEF_VIS int ovwrt_ionic_dv_qp_set_puec_plane_route(struct ibv_qp* verbs_qp,
+                                                        uint8_t plane_idx,
+                                                        void* route) {
+  struct mrc_qp* vmrc_qp;
+  struct ibv_qp* real_qp;
+
+  VMRC_DEBUG_PRINT("In ionic_dv_qp_set_puec_plane_route");
+
+  VMRC_CHECK_PRINT_EXIT(verbs_qp, 1, "set_puec_plane_route: NULL qp");
+
+  /* Recover the real ionic QP: mrc_qp* stored in send_cq, ibv_qp* is first member. */
+  vmrc_qp = (struct mrc_qp*)verbs_qp->send_cq;
+  VMRC_CHECK_PRINT_EXIT(vmrc_qp, 1, "set_puec_plane_route: no mrc_qp on dummy");
+  real_qp = ((struct ibv_qp**)vmrc_qp)[0];
+  VMRC_CHECK_PRINT_EXIT(real_qp, 1, "set_puec_plane_route: no real ibv_qp");
+
+  if (g_real_ionic_set_puec_plane_route == NULL) {
+    void* sym = vmrc_resolve_ionic_sym("ionic_dv_qp_set_puec_plane_route", "IONIC_1.0");
+    VMRC_CHECK_PRINT_EXIT(sym, 1,
+        "set_puec_plane_route: cannot resolve real provider symbol");
+    *(void**)&g_real_ionic_set_puec_plane_route = sym;
+  }
+
+  return g_real_ionic_set_puec_plane_route(real_qp, plane_idx, route);
+}
+
+/*
+ * Intercept ionic_dv_pd_set_udma_mask.
+ *
+ * Unlike the QP helpers above, ibv_alloc_pd() is a straight pass-through in the
+ * shim, so the PD the app holds is already a genuine ionic PD (not a dummy).
+ * We therefore forward directly to the real provider symbol (resolved via
+ * RTLD_NEXT) with the app's PD unchanged -- no dummy recovery needed. This
+ * export exists so ANP (which hard-links libionic) resolves the symbol from the
+ * shim instead of requiring libionic to load, which would drag in the native
+ * verbs provider ABI (IBVERBS_PRIVATE_34) the shim does not provide.
+ */
+static int (*g_real_ionic_pd_set_udma_mask)(struct ibv_pd*, uint8_t) = NULL;
+
+__asm__(".symver ovwrt_ionic_dv_pd_set_udma_mask, "
+        "ionic_dv_pd_set_udma_mask@@IONIC_1.0");
+VMRC_DEF_VIS int ovwrt_ionic_dv_pd_set_udma_mask(struct ibv_pd* pd,
+                                                 uint8_t udma_mask) {
+  VMRC_DEBUG_PRINT("In ionic_dv_pd_set_udma_mask");
+
+  VMRC_CHECK_PRINT_EXIT(pd, 1, "set_udma_mask: NULL pd");
+
+  if (g_real_ionic_pd_set_udma_mask == NULL) {
+    void* sym = vmrc_resolve_ionic_sym("ionic_dv_pd_set_udma_mask", "IONIC_1.0");
+    VMRC_CHECK_PRINT_EXIT(sym, 1,
+        "set_udma_mask: cannot resolve real provider symbol");
+    *(void**)&g_real_ionic_pd_set_udma_mask = sym;
+  }
+
+  return g_real_ionic_pd_set_udma_mask(pd, udma_mask);
+}
+#endif /* HAVE_IONIC_DV */
 
 /*
  * Overwrites ibv_open_device. Queries if the device supports MRC. Errors out if the required capability is not present.
@@ -87,7 +331,7 @@ struct ibv_qp* vmrc_ibv_overwrite_create_qp_ex(struct ibv_context* context,
  */
 __asm__(".symver ovwrt_ibv_open_device, ibv_open_device@@IBVERBS_1.1");
 VMRC_DEF_VIS struct ibv_context* ovwrt_ibv_open_device(struct ibv_device* device) {
-  struct mrc_attr attr;
+  struct mrc_device_attr attr;
   struct vmrc_symbols_t* symbols;
   struct ibv_context* verbs_context;
   struct mrc_context* vmrc_context;
@@ -96,6 +340,7 @@ VMRC_DEF_VIS struct ibv_context* ovwrt_ibv_open_device(struct ibv_device* device
   int mrc_errno;
   struct verbs_context* vctx;
   int mrc_supported;
+  void* addr_of_value;
 
   VMRC_DEBUG_PRINT("In ibv_open_device");
 
@@ -131,14 +376,26 @@ VMRC_DEF_VIS struct ibv_context* ovwrt_ibv_open_device(struct ibv_device* device
   /* Insert key, value. */
   vmrc_ht_insert(hashtable, verbs_context, vmrc_context);
 
-  /* Overwrite create_qp_ex. */
+  /* Overwrite create_qp_ex. Save the original first in per-context storage so
+   * libmrc's internal provider-QP creation (which dispatches through this op)
+   * reaches the real provider instead of recursing back into the shim.
+   * Per-context storage makes this provider-neutral and thread-safe. */
   vctx = verbs_get_ctx_op(verbs_context, create_qp_ex);
   if (!vctx) {
+    vmrc_ht_delete(hashtable, verbs_context);
     mrc_errno = symbols->mrc_destroy_context_internal(vmrc_context);
     VMRC_CHECK_PRINT_EXIT(mrc_errno == 0, 1, "Error in mrc_destroy_context");
     errno = EOPNOTSUPP;
     return NULL;
   }
+
+  /* Store the original create_qp_ex pointer in the hashtable attribute for this context.
+   * vmrc_ht_attr_insert allocates its own node and stores the given pointer as the
+   * payload, so pass the function pointer directly (do not pre-wrap it). It takes
+   * addr_of_value (&entry->value), not the value itself. */
+  (void)vmrc_ht_search_plus_addr(hashtable, verbs_context, &addr_of_value);
+  vmrc_ht_attr_insert(addr_of_value, (void*)vctx->create_qp_ex, VMRC_HT_ATTR_ORIG_CREATE_QP_EX_IDX);
+
   vctx->create_qp_ex = &vmrc_ibv_overwrite_create_qp_ex;
 
   return verbs_context;
@@ -179,6 +436,9 @@ VMRC_DEF_VIS int ovwrt_ibv_close_device(struct ibv_context* verbs_context) {
     VMRC_CHECK_PRINT_EXIT(mrc_errno == 0, 1, "Error in mrc_destroy_qp_hint");
     attr = (struct vmrc_ht_linked_list*)attr->ptr_and_next[VMRC_HT_LL_NEXT];
   }
+
+  /* The saved original create_qp_ex attribute node is freed by vmrc_ht_delete
+   * below, along with all other attr nodes for this entry. */
 
   mrc_errno = symbols->mrc_destroy_context_internal(vmrc_context);
   VMRC_CHECK_PRINT_EXIT(mrc_errno == 0, 1, "Error in mrc_destroy_context");
