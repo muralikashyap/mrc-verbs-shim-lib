@@ -114,6 +114,10 @@ struct ibv_qp* vmrc_ibv_overwrite_create_qp_ex(struct ibv_context* context,
   return orig_create_qp_ex(context, qp_init_attr_ex);
 }
 
+/* Forward declaration: the create_cq_ex op is wired in ovwrt_ibv_open_device
+ * (below), but the implementation lives after the classic CQ handlers. */
+struct ibv_cq_ex* vmrc_ibv_overwrite_create_cq_ex(struct ibv_context* context, struct ibv_cq_init_attr_ex* cq_attr);
+
 #ifdef HAVE_IONIC_DV
 /*
  * Resolve a genuine provider ionic_dv_* symbol.
@@ -339,6 +343,14 @@ VMRC_DEF_VIS struct ibv_context* ovwrt_ibv_open_device(struct ibv_device* device
 
   vctx->create_qp_ex = &vmrc_ibv_overwrite_create_qp_ex;
 
+  /* Overwrite create_cq_ex so apps that call ibv_create_cq_ex() (e.g. perftest
+   * built with cq_ex support) get an MRC-backed CQ instead of a genuine provider
+   * CQ that would bypass MRC. Unlike create_qp_ex, this op is only ever reached
+   * from the application: libmrc's own internal provider-CQ creation uses the
+   * classic ibv_create_cq() path, so there is no recursion and no original op to
+   * save. vctx is the same verbs_context resolved above. */
+  vctx->create_cq_ex = &vmrc_ibv_overwrite_create_cq_ex;
+
   return verbs_context;
 }
 
@@ -389,6 +401,148 @@ VMRC_DEF_VIS int ovwrt_ibv_close_device(struct ibv_context* verbs_context) {
 
   /* Destroy the verbs context. */
   return symbols->ibv_close_device_internal(verbs_context);
+}
+
+/*
+ * Extended-CQ (ibv_cq_ex) wrapper.
+ *
+ * ibv_cq_ex has no ops dispatch table: ibv_start_poll/ibv_next_poll/ibv_end_poll
+ * and the ibv_wc_read_* accessors are function pointers stored inside the struct
+ * itself, invoked directly by the app-side inlines in <infiniband/verbs.h>. We
+ * therefore embed an ibv_cq_ex we fully own, plus a cached ibv_wc that the
+ * accessors read from between start_poll/next_poll and end_poll.
+ *
+ * cq_ex MUST be the first member: the value returned to the app is a struct
+ * ibv_cq_ex*, and ibv_cq_ex_to_cq() casts it straight to struct ibv_cq*. Because
+ * ibv_cq and ibv_cq_ex share their leading layout, cq_ex.channel doubles as the
+ * mrc_cq* slot (same convention as the classic CQ path) and cq_ex.context holds
+ * our dummy verbs context carrying ops.poll_cq (so classic ibv_poll_cq on the
+ * down-cast CQ still routes through MRC -- which is exactly how perftest polls).
+ * This shared layout also lets the classic ovwrt_ibv_destroy_cq free an ex CQ
+ * unchanged: free(context), mrc_destroy_cq(channel), free(base pointer) -- and
+ * free(&wrap->cq_ex) frees the whole wrapper since cq_ex is first.
+ */
+struct vmrc_cq_ex {
+  struct ibv_cq_ex cq_ex; /* MUST be first: returned pointer aliases ibv_cq*. */
+  struct ibv_wc cur_wc;   /* Completion cached for the read_* accessors. */
+};
+
+/* Defined just below; the ex CQ wires it into its dummy context's ops.poll_cq. */
+int vmrc_ibv_overwrite_poll_cq(struct ibv_cq* cq, int num_entries, struct ibv_wc* wc);
+
+static inline struct vmrc_cq_ex* vmrc_cq_ex_of(struct ibv_cq_ex* cq) { return (struct vmrc_cq_ex*)cq; }
+
+/* start_poll/next_poll pull exactly one completion from MRC into cur_wc and
+ * surface status/wr_id on the cq_ex, matching rdma-core semantics: return 0 when
+ * a completion is available, ENOENT when the CQ is empty, and the errno on error. */
+static int vmrc_cq_ex_poll_one(struct ibv_cq_ex* cq) {
+  struct vmrc_symbols_t* symbols;
+  struct vmrc_cq_ex* wrap = vmrc_cq_ex_of(cq);
+  int ne;
+
+  symbols = vmrc_symbols_get();
+  VMRC_CHECK_PRINT_EXIT(symbols, 1, "cq_ex poll: could not get symbols");
+
+  ne = symbols->mrc_poll_cq_internal((struct mrc_cq*)cq->channel, 1, &wrap->cur_wc);
+  if (ne < 0) return errno ? errno : EIO;
+  if (ne == 0) return ENOENT;
+
+  cq->status = wrap->cur_wc.status;
+  cq->wr_id = wrap->cur_wc.wr_id;
+  return 0;
+}
+
+static int vmrc_cq_ex_start_poll(struct ibv_cq_ex* cq, struct ibv_poll_cq_attr* attr) {
+  (void)attr;
+  return vmrc_cq_ex_poll_one(cq);
+}
+
+static int vmrc_cq_ex_next_poll(struct ibv_cq_ex* cq) { return vmrc_cq_ex_poll_one(cq); }
+
+static void vmrc_cq_ex_end_poll(struct ibv_cq_ex* cq) { (void)cq; }
+
+/* read_* accessors: every field MRC populates in the standard ibv_wc. Timestamp,
+ * SLID/SL/path-bits, cvlan, flow_tag and tm_info are intentionally absent -- MRC's
+ * ibv_wc does not carry them, and create rejects any wc_flags requesting them. */
+static enum ibv_wc_opcode vmrc_cq_ex_read_opcode(struct ibv_cq_ex* cq) { return vmrc_cq_ex_of(cq)->cur_wc.opcode; }
+static uint32_t vmrc_cq_ex_read_vendor_err(struct ibv_cq_ex* cq) { return vmrc_cq_ex_of(cq)->cur_wc.vendor_err; }
+static uint32_t vmrc_cq_ex_read_byte_len(struct ibv_cq_ex* cq) { return vmrc_cq_ex_of(cq)->cur_wc.byte_len; }
+static __be32 vmrc_cq_ex_read_imm_data(struct ibv_cq_ex* cq) { return vmrc_cq_ex_of(cq)->cur_wc.imm_data; }
+static uint32_t vmrc_cq_ex_read_qp_num(struct ibv_cq_ex* cq) { return vmrc_cq_ex_of(cq)->cur_wc.qp_num; }
+static uint32_t vmrc_cq_ex_read_src_qp(struct ibv_cq_ex* cq) { return vmrc_cq_ex_of(cq)->cur_wc.src_qp; }
+static unsigned int vmrc_cq_ex_read_wc_flags(struct ibv_cq_ex* cq) { return vmrc_cq_ex_of(cq)->cur_wc.wc_flags; }
+
+/*
+ * Overwrite of the create_cq_ex op (reached via ibv_create_cq_ex()).
+ *
+ * Builds an MRC-backed CQ and wraps it in a struct vmrc_cq_ex we fully control.
+ * The wrapper is returned as an ibv_cq_ex*; because its first member aliases
+ * ibv_cq*, apps that down-cast with ibv_cq_ex_to_cq() and poll classically go
+ * through ops.poll_cq -> MRC, while apps using the extended accessors go through
+ * the function pointers wired below.
+ */
+struct ibv_cq_ex* vmrc_ibv_overwrite_create_cq_ex(struct ibv_context* verbs_context,
+                                                  struct ibv_cq_init_attr_ex* cq_attr) {
+  struct vmrc_ht* hashtable;
+  struct mrc_context* vmrc_context;
+  struct vmrc_symbols_t* symbols;
+  struct vmrc_cq_ex* wrap;
+  struct mrc_cq* vmrc_cq;
+  struct ibv_context* dummy_verbs_context;
+
+  VMRC_DEBUG_PRINT("In ibv_create_cq_ex");
+
+  VMRC_CHECK_PRINT_EXIT(cq_attr, 1, "create_cq_ex: NULL cq_attr");
+  VMRC_CHECK_PRINT_EXIT(cq_attr->channel == NULL, 1, "create_cq_ex: non-NULL completion channel not yet supported");
+
+  /* MRC's ibv_wc carries no hardware completion timestamp; reject rather than
+   * return silently-wrong latency numbers. */
+  VMRC_CHECK_PRINT_EXIT(
+      (cq_attr->wc_flags & (IBV_WC_EX_WITH_COMPLETION_TIMESTAMP | IBV_WC_EX_WITH_COMPLETION_TIMESTAMP_WALLCLOCK)) == 0,
+      1, "create_cq_ex: completion-timestamp wc_flags not supported by verbs-mrc");
+
+  hashtable = vmrc_ht_get();
+  VMRC_CHECK_PRINT_EXIT(hashtable, 1, "create_cq_ex: could not get context hashtable");
+
+  vmrc_context = (struct mrc_context*)vmrc_ht_search(hashtable, verbs_context);
+  VMRC_CHECK_PRINT_EXIT_VA_ARGS(vmrc_context, 1, "create_cq_ex: no matching MRC context for verbs context %p",
+                                verbs_context);
+
+  symbols = vmrc_symbols_get();
+  VMRC_CHECK_PRINT_EXIT(symbols, 1, "create_cq_ex: could not get symbols");
+
+  vmrc_cq =
+      symbols->mrc_create_cq_internal(vmrc_context, cq_attr->cqe, cq_attr->cq_context, NULL, cq_attr->comp_vector);
+  VMRC_CHECK_PRINT_EXIT(vmrc_cq, 1, "create_cq_ex: error in mrc_create_cq");
+
+  wrap = calloc(1, sizeof(struct vmrc_cq_ex));
+  VMRC_CHECK_PRINT_EXIT(wrap, 1, "create_cq_ex: unable to allocate the dummy verbs CQ");
+
+  /* mrc_cq* lives in channel (same slot the classic path and destroy_cq use). */
+  wrap->cq_ex.channel = (void*)vmrc_cq;
+  wrap->cq_ex.cq_context = cq_attr->cq_context;
+  wrap->cq_ex.cqe = cq_attr->cqe;
+
+  /* Extended poll + read entry points. */
+  wrap->cq_ex.start_poll = &vmrc_cq_ex_start_poll;
+  wrap->cq_ex.next_poll = &vmrc_cq_ex_next_poll;
+  wrap->cq_ex.end_poll = &vmrc_cq_ex_end_poll;
+  wrap->cq_ex.read_opcode = &vmrc_cq_ex_read_opcode;
+  wrap->cq_ex.read_vendor_err = &vmrc_cq_ex_read_vendor_err;
+  wrap->cq_ex.read_byte_len = &vmrc_cq_ex_read_byte_len;
+  wrap->cq_ex.read_imm_data = &vmrc_cq_ex_read_imm_data;
+  wrap->cq_ex.read_qp_num = &vmrc_cq_ex_read_qp_num;
+  wrap->cq_ex.read_src_qp = &vmrc_cq_ex_read_src_qp;
+  wrap->cq_ex.read_wc_flags = &vmrc_cq_ex_read_wc_flags;
+
+  /* Dummy verbs context carrying ops.poll_cq, so classic ibv_poll_cq() on the
+   * down-cast CQ (ibv_cq_ex_to_cq) still routes through MRC. */
+  dummy_verbs_context = calloc(1, sizeof(struct ibv_context));
+  VMRC_CHECK_PRINT_EXIT(dummy_verbs_context, 1, "create_cq_ex: unable to allocate the dummy verbs context");
+  dummy_verbs_context->ops.poll_cq = &vmrc_ibv_overwrite_poll_cq;
+  wrap->cq_ex.context = dummy_verbs_context;
+
+  return &wrap->cq_ex;
 }
 
 /* Overwrite for poll_cq. This is passed as a function pointer. */
