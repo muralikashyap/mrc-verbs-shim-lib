@@ -495,11 +495,21 @@ struct ibv_cq_ex* vmrc_ibv_overwrite_create_cq_ex(struct ibv_context* verbs_cont
   VMRC_CHECK_PRINT_EXIT(cq_attr, 1, "create_cq_ex: NULL cq_attr");
   VMRC_CHECK_PRINT_EXIT(cq_attr->channel == NULL, 1, "create_cq_ex: non-NULL completion channel not yet supported");
 
-  /* MRC's ibv_wc carries no hardware completion timestamp; reject rather than
-   * return silently-wrong latency numbers. */
-  VMRC_CHECK_PRINT_EXIT(
-      (cq_attr->wc_flags & (IBV_WC_EX_WITH_COMPLETION_TIMESTAMP | IBV_WC_EX_WITH_COMPLETION_TIMESTAMP_WALLCLOCK)) == 0,
-      1, "create_cq_ex: completion-timestamp wc_flags not supported by verbs-mrc");
+  /* MRC's ibv_wc does not populate: pkey_index, slid, sl, dlid_path_bits (the
+   * standard ibv_wc has them but MRC's internal wc leaves them uninitialized),
+   * nor the extended fields (timestamp, cvlan, flow_tag, tm_info) since MRC has
+   * no hardware completion timestamp and no encap metadata. Reject rather than
+   * return silently-wrong values. The bits MRC does support (byte_len, imm_data,
+   * qp_num, src_qp, wc_flags themselves) are in IBV_WC_STANDARD_FLAGS, but that
+   * constant is only in recent rdma-core (>=v28). So we invert the check: reject
+   * anything NOT in the standard set. */
+#define MRC_UNSUPPORTED_WC_FLAGS                                                                               \
+  (IBV_WC_EX_WITH_COMPLETION_TIMESTAMP | IBV_WC_EX_WITH_COMPLETION_TIMESTAMP_WALLCLOCK | IBV_WC_EX_WITH_SLID | \
+   IBV_WC_EX_WITH_SL | IBV_WC_EX_WITH_DLID_PATH_BITS | IBV_WC_EX_WITH_CVLAN | IBV_WC_EX_WITH_FLOW_TAG |        \
+   IBV_WC_EX_WITH_TM_INFO)
+  VMRC_CHECK_PRINT_EXIT((cq_attr->wc_flags & MRC_UNSUPPORTED_WC_FLAGS) == 0, 1,
+                        "create_cq_ex: unsupported wc_flags requested (MRC does not populate "
+                        "timestamp/slid/sl/dlid_path_bits/cvlan/flow_tag/tm_info)");
 
   hashtable = vmrc_ht_get();
   VMRC_CHECK_PRINT_EXIT(hashtable, 1, "create_cq_ex: could not get context hashtable");
