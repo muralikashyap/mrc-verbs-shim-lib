@@ -76,42 +76,109 @@ VMRC_WRAP_SYMVER(ibv_event_type_str, "IBVERBS_1.1", const char*, (enum ibv_event
 VMRC_WRAP_SYMVER_ERR(ibv_query_ece, "IBVERBS_1.10", int, (struct ibv_qp * qp, struct ibv_ece* ece), (qp, ece))
 VMRC_WRAP_SYMVER_ERR(ibv_set_ece, "IBVERBS_1.10", int, (struct ibv_qp * qp, struct ibv_ece* ece), (qp, ece))
 
+/* Forward declarations for post_send/post_recv used in create_qp_ex. */
+int vmrc_ibv_overwrite_post_send(struct ibv_qp* qp, struct ibv_send_wr* wr, struct ibv_send_wr** bad_wr);
+int vmrc_ibv_overwrite_post_recv(struct ibv_qp* qp, struct ibv_recv_wr* wr, struct ibv_recv_wr** bad_wr);
+
 /*
- * Original provider create_qp_ex, saved per-context before we overwrite the op in
- * open_device.
+ * Overwrite of the create_qp_ex op (reached via ibv_create_qp_ex()).
  *
- * On this rdma-core, the app's plain ibv_create_qp() resolves to our symbol override
- * ovwrt_ibv_create_qp() (which does the MRC QP setup). That MRC path then calls the
- * REAL ibv_create_qp() to build the underlying provider QP, and rdma-core dispatches
- * that real call through context->ops.create_qp_ex -- i.e. this trap. So the only
- * caller that reaches this trap is libmrc's internal provider-QP creation, which must
- * go to the genuine provider, not back into the shim (that would recurse infinitely).
- * Forward to the saved original.
+ * Builds an MRC-backed QP and wraps it in a dummy ibv_qp we fully control. Unlike
+ * create_cq_ex, this op is reached both from applications (when they call
+ * ibv_create_qp_ex with extended attributes) AND would be reached from libmrc if
+ * it called ibv_create_qp_ex internally. However, libmrc's internal provider-QP
+ * creation uses the classic ibv_create_qp() path (verified in mrc_ibv.c:76-77,
+ * which dlsyms "ibv_create_qp", not "ibv_create_qp_ex"), so there is no recursion
+ * and no original op needs to be saved.
  *
- * Per-context storage makes this provider-neutral and thread-safe (no global state).
+ * This matches the create_cq_ex pattern: directly call MRC, build a wrapper, return.
  */
 struct ibv_qp* vmrc_ibv_overwrite_create_qp_ex(struct ibv_context* context,
                                                struct ibv_qp_init_attr_ex* qp_init_attr_ex) {
+  struct vmrc_symbols_t* symbols;
+  struct ibv_context* dummy_verbs_context;
   struct vmrc_ht* hashtable;
-  void* addr_of_value;
-  struct ibv_qp* (*orig_create_qp_ex)(struct ibv_context*, struct ibv_qp_init_attr_ex*);
-  struct vmrc_ht_linked_list* attr;
+  struct mrc_context* vmrc_context;
+  struct mrc_qp* vmrc_qp;
+  struct ibv_qp* verbs_qp;
+  struct mrc_qp_init_attr mrc_qp_attr;
+  struct ibv_pd* pd;
+  void* ptr;
+  int mrc_errno;
 
+  VMRC_DEBUG_PRINT("In ibv_create_qp_ex");
+
+  /* Validate QP type. */
+  VMRC_CHECK_PRINT_EXIT(qp_init_attr_ex->qp_type == IBV_QPT_RC, 1,
+                        "create_qp_ex: Only RC QP types are supported");
+
+  /* Extract PD from the extended attributes. */
+  VMRC_CHECK_PRINT_EXIT(qp_init_attr_ex->comp_mask & IBV_QP_INIT_ATTR_PD, 1,
+                        "create_qp_ex: comp_mask must include IBV_QP_INIT_ATTR_PD");
+  pd = qp_init_attr_ex->pd;
+  VMRC_CHECK_PRINT_EXIT(pd, 1, "create_qp_ex: NULL pd in qp_init_attr_ex");
+
+  symbols = vmrc_symbols_get();
+  VMRC_CHECK_PRINT_EXIT(symbols, 1, "create_qp_ex: Could not get symbols");
+
+  /* Get MRC context from hashtable. */
   hashtable = vmrc_ht_get();
-  VMRC_CHECK_PRINT_EXIT(hashtable, 1, "create_qp_ex: could not get hashtable");
+  VMRC_CHECK_PRINT_EXIT(hashtable, 1, "create_qp_ex: Could not get hashtable");
+  vmrc_context = vmrc_ht_search(hashtable, context);
+  VMRC_CHECK_PRINT_EXIT_VA_ARGS(vmrc_context, 1,
+                                "create_qp_ex: Could not find the matching MRC context for verbs context %p", context);
 
-  /* Find the context entry to retrieve the saved original create_qp_ex pointer. */
-  (void)vmrc_ht_search_plus_addr(hashtable, context, &addr_of_value);
-  VMRC_CHECK_PRINT_EXIT(addr_of_value, 1, "create_qp_ex: context not found in hashtable");
+  /* Fill MRC QP attributes from extended attributes. */
+  memset(&mrc_qp_attr, 0, sizeof(struct mrc_qp_init_attr));
+  mrc_qp_attr.qp_context = qp_init_attr_ex->qp_context;
+  mrc_qp_attr.send_cq = (void*)qp_init_attr_ex->send_cq->channel;
+  mrc_qp_attr.recv_cq = (void*)qp_init_attr_ex->recv_cq->channel;
+  mrc_qp_attr.pd = pd;
+  mrc_qp_attr.cap = qp_init_attr_ex->cap;
+  mrc_qp_attr.sq_sig_all = qp_init_attr_ex->sq_sig_all;
 
-  attr = (struct vmrc_ht_linked_list*)vmrc_ht_attr_get(addr_of_value, VMRC_HT_ATTR_ORIG_CREATE_QP_EX_IDX);
-  VMRC_CHECK_PRINT_EXIT(attr, 1, "create_qp_ex: original provider op was not saved");
+  /* Create MRC QP. */
+  vmrc_qp = symbols->mrc_create_qp_internal(vmrc_context, &mrc_qp_attr);
+  VMRC_CHECK_PRINT_EXIT(vmrc_qp, 1, "create_qp_ex: Error while calling mrc_create_qp");
 
-  orig_create_qp_ex =
-      (struct ibv_qp * (*)(struct ibv_context*, struct ibv_qp_init_attr_ex*)) attr->ptr_and_next[VMRC_HT_LL_PTR];
-  VMRC_CHECK_PRINT_EXIT(orig_create_qp_ex, 1, "create_qp_ex: saved pointer is NULL");
+  /* Allocate a dummy ibv_qp. */
+  verbs_qp = calloc(1, sizeof(struct ibv_qp));
+  VMRC_CHECK_PRINT_EXIT(verbs_qp, 1, "create_qp_ex: Unable to allocate the dummy verbs QP");
 
-  return orig_create_qp_ex(context, qp_init_attr_ex);
+  /* Put MRC qp_num in verbs_qp->qp_num. */
+  mrc_errno = symbols->mrc_get_qpn_internal(vmrc_qp, &verbs_qp->qp_num);
+  VMRC_CHECK_PRINT_EXIT(mrc_errno == 0, 1, "create_qp_ex: Unable to call mrc_get_qpn");
+
+  /* Put qp_context. */
+  verbs_qp->qp_context = qp_init_attr_ex->qp_context;
+
+  /* Put MRC QP in send_cq. */
+  verbs_qp->send_cq = (void*)vmrc_qp;
+
+  /* Allocate dummy verbs context. */
+  dummy_verbs_context = calloc(1, sizeof(struct ibv_context));
+  VMRC_CHECK_PRINT_EXIT(dummy_verbs_context, 1, "create_qp_ex: Unable to allocate the dummy verbs context");
+
+  /* Put overwrites of post_send, post_recv. */
+  dummy_verbs_context->ops.post_send = &vmrc_ibv_overwrite_post_send;
+  dummy_verbs_context->ops.post_recv = &vmrc_ibv_overwrite_post_recv;
+
+  /* Put the dummy verbs context in the returned QP's qp->context. */
+  verbs_qp->context = dummy_verbs_context;
+
+  /* Put the actual verbs context in verbs_qp->pd and verbs_qp->recv_cq. */
+  verbs_qp->pd = pd;
+  verbs_qp->recv_cq = (void*)context;
+
+  /* Allocate storage for gid raw and store the input send_cq and recv_cq. */
+  verbs_qp->srq = (void*)calloc(16 + 2 * (sizeof(void*) / sizeof(uint8_t)), sizeof(uint8_t));
+  ptr = (void*)verbs_qp->srq;
+  ptr = ptr + (16 / sizeof(void*));
+  ptr = (void*)qp_init_attr_ex->send_cq;
+  ptr = ptr + 1;
+  ptr = (void*)qp_init_attr_ex->recv_cq;
+
+  return verbs_qp;
 }
 
 /* Forward declaration: the create_cq_ex op is wired in ovwrt_ibv_open_device
@@ -321,10 +388,11 @@ VMRC_DEF_VIS struct ibv_context* ovwrt_ibv_open_device(struct ibv_device* device
   /* Insert key, value. */
   vmrc_ht_insert(hashtable, verbs_context, vmrc_context);
 
-  /* Overwrite create_qp_ex. Save the original first in per-context storage so
-   * libmrc's internal provider-QP creation (which dispatches through this op)
-   * reaches the real provider instead of recursing back into the shim.
-   * Per-context storage makes this provider-neutral and thread-safe. */
+  /* Overwrite create_qp_ex so apps that call ibv_create_qp_ex() go through MRC.
+   * Unlike create_cq_ex (where recursion was possible because some providers'
+   * internal ibv_create_cq might dispatch through create_cq_ex), libmrc's
+   * internal provider-QP creation uses ibv_create_qp (not _ex), verified at
+   * mrc_ibv.c:76-77, so no recursion occurs and no original pointer needs saving. */
   vctx = verbs_get_ctx_op(verbs_context, create_qp_ex);
   if (!vctx) {
     vmrc_ht_delete(hashtable, verbs_context);
@@ -333,13 +401,6 @@ VMRC_DEF_VIS struct ibv_context* ovwrt_ibv_open_device(struct ibv_device* device
     errno = EOPNOTSUPP;
     return NULL;
   }
-
-  /* Store the original create_qp_ex pointer in the hashtable attribute for this context.
-   * vmrc_ht_attr_insert allocates its own node and stores the given pointer as the
-   * payload, so pass the function pointer directly (do not pre-wrap it). It takes
-   * addr_of_value (&entry->value), not the value itself. */
-  (void)vmrc_ht_search_plus_addr(hashtable, verbs_context, &addr_of_value);
-  vmrc_ht_attr_insert(addr_of_value, (void*)vctx->create_qp_ex, VMRC_HT_ATTR_ORIG_CREATE_QP_EX_IDX);
 
   vctx->create_qp_ex = &vmrc_ibv_overwrite_create_qp_ex;
 
